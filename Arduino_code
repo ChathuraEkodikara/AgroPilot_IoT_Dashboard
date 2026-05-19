@@ -57,8 +57,8 @@ DHT dht(DHTPIN, DHTTYPE);
 #define HISTORY_LIMIT 100
 
 /*telegram bot*/
-#define TELEGRAM_BOT_TOKEN "8204369295:AAHoBN5KOxVoks14Bd3OFXAXH-5LliYSGJM"
-#define TELEGRAM_CHAT_ID "1080330169"
+#define TELEGRAM_BOT_TOKEN ""; //addtokenhere
+#define TELEGRAM_CHAT_ID //addchatid
 
 bool highTempSent = false;
 bool lowSoilSent = false;
