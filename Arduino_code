@@ -1,0 +1,893 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <Firebase_ESP_Client.h>
+#include "DHT.h"
+#include <BH1750.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "esp_system.h"
+
+#define TOUCH_PIN 5
+
+Preferences prefs;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+unsigned long lastWiFiCheck = 0;
+unsigned long lastDisplaySwitch = 0;
+int displayMode = 0;
+
+bool wifiOK = false;
+bool firebaseOK = false;
+
+BH1750 lightMeter;
+
+/* ================= WIFI ================= */
+#define WIFI_SSID "XOR"
+#define WIFI_PASSWORD "012345600"
+
+/* ================= FIREBASE ================= */
+#define API_KEY "AIzaSyAEAGpHaCg0uUIyrsa165zY5xECBn0JpuY"
+#define DATABASE_URL "https://test-project-f4a2b-default-rtdb.firebaseio.com/"
+
+/* ================= DHT ================= */
+#define DHTPIN 32
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/* ================= SOIL ================= */
+#define SOIL_PIN 34
+#define SOIL_DRY 2559
+#define SOIL_WET 1200
+
+/* ================= RELAYS ================= */
+#define FAN_RELAY_PIN 26
+#define PUMP_RELAY_PIN 27
+
+/*Gas Sensor*/
+#define MQ135_PIN 35
+#define RESET_WIFI_PIN 25
+
+#define HISTORY_LIMIT 100
+
+/*telegram bot*/
+#define TELEGRAM_BOT_TOKEN "8204369295:AAHoBN5KOxVoks14Bd3OFXAXH-5LliYSGJM"
+#define TELEGRAM_CHAT_ID "1080330169"
+
+bool highTempSent = false;
+bool lowSoilSent = false;
+bool badAirSent = false;
+bool dhtFailSent = false;
+bool soilFailSent = false;
+
+int airOn = 40;   // below this → bad air
+int airOff = 60;  // above this → good air
+
+unsigned long lastHistory = 0;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* ================= STATE VARIABLES ================= */
+
+bool fanState = false;
+bool pumpState = false;
+
+String mode = "AUTO";
+bool manualFanCommand = false;
+
+String pumpMode = "AUTO";
+bool pumpManualCommand = false;
+
+/* Default thresholds */
+
+float tempOn = 35;
+float tempOff = 32;
+float humOn = 80;
+float humOff = 75;
+
+int soilOn = 30;
+int soilOff = 60;
+
+bool displayState = true;
+int lastTouchState = LOW;
+
+/* ================= WATCHDOG ================= */
+
+bool dhtOK = true;
+bool soilOK = true;
+
+unsigned long lastSensorUpdate = 0;
+const unsigned long sensorTimeout = 15000;
+
+/* ================= SETUP ================= */
+
+void setup() {
+
+  Wire.begin(21, 22);
+
+  if (lightMeter.begin()) {
+    Serial.println("BH1750 initialized");
+  } else {
+    Serial.println("BH1750 not found");
+  }
+
+  Serial.begin(115200);
+  Serial.print("Reset reason: ");
+  Serial.println(esp_reset_reason());
+  delay(2000);
+
+  Serial.println("=== ESP32 BOOTING ===");
+
+  dht.begin();
+
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+
+  digitalWrite(FAN_RELAY_PIN, LOW);
+  digitalWrite(PUMP_RELAY_PIN, LOW);
+
+  /*------WiFi Reset--------------*/
+  pinMode(RESET_WIFI_PIN, INPUT_PULLUP);
+
+  /* ---------- WiFi ---------- */
+  WiFiManager wm;
+
+  Serial.println("Starting WiFi Manager...");
+
+  bool res = wm.autoConnect("SmartAgriWiFi");
+
+  if (!res) {
+    Serial.println("Failed to connect");
+    ESP.restart();
+  }
+  else {
+    Serial.println("Connected to WiFi");
+    Serial.println(WiFi.localIP());
+  }
+
+  sendTelegramMessage("SmartAgri started successfully");
+
+  pinMode(TOUCH_PIN, INPUT);
+
+  /* ---------- Firebase ---------- */
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase OK");
+  }
+  else {
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Setup complete");
+
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+  analogSetPinAttenuation(MQ135_PIN, ADC_11db);
+
+  prefs.begin("settings", false);
+
+  // Load saved values (default if not exist)
+  tempOn  = prefs.getFloat("tempOn", 35);
+  tempOff = prefs.getFloat("tempOff", 32);
+  humOn   = prefs.getFloat("humOn", 80);
+  humOff  = prefs.getFloat("humOff", 75);
+  soilOn  = prefs.getInt("soilOn", 30);
+  soilOff = prefs.getInt("soilOff", 60);
+
+  Serial.println("Loaded saved thresholds");
+
+  Serial.println("---- Stored Values ----");
+  Serial.println(tempOn);
+  Serial.println(tempOff);
+  Serial.println(humOn);
+  Serial.println(humOff);
+  Serial.println(soilOn);
+  Serial.println(soilOff);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.clearDisplay();
+
+  display.setCursor(10, 20);
+  display.setTextSize(1);
+  display.println("Hello it is");
+
+  display.setCursor(10, 35);
+  display.setTextSize(2);
+  display.println("AgroPilot");
+
+  display.display();
+
+  delay(3000); // show for 3 seconds
+}
+
+void drawWiFiBars(int rssi) {
+
+  int bars = 0;
+
+  if (rssi > -50) bars = 4;
+  else if (rssi > -65) bars = 3;
+  else if (rssi > -75) bars = 2;
+  else if (rssi > -85) bars = 1;
+  else bars = 0;
+
+  int x = 100;   // right side
+  int y = 10;
+
+  for (int i = 0; i < 4; i++) {
+
+    int height = (i + 1) * 3;  // increasing height
+
+    if (i < bars) {
+      display.fillRect(x + i * 6, y - height, 4, height, SSD1306_WHITE);
+    } else {
+      display.drawRect(x + i * 6, y - height, 4, height, SSD1306_WHITE);
+    }
+  }
+}
+
+void updateDisplay(float temp, float hum, int soil, float lux, int air) {
+
+  // Auto switch every 3 seconds
+  if (millis() - lastDisplaySwitch > 3000) {
+    lastDisplaySwitch = millis();
+    displayMode++;
+    if (displayMode > 4) displayMode = 0;
+  }
+
+  display.clearDisplay();
+
+  // ===== TOP LINE (WiFi status) =====
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiOK) {
+      display.print("WiFi: OK");
+    } else {
+      display.print("WiFi: OFF");
+    }
+
+    drawWiFiBars(WiFi.RSSI());
+
+  } else {
+    display.print("WiFi: NO");
+    drawWiFiBars(-100);
+  }
+
+  display.setCursor(0, 10);
+
+  if (!wifiOK) {
+    display.print("OFFLINE MODE");
+  }
+
+  // ===== SENSOR DISPLAY =====
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+
+  display.setTextSize(2);
+  display.setCursor(0, 35);
+
+  switch (displayMode) {
+
+    case 0:
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Temperature");
+
+      display.setCursor(0, 35);
+      display.setTextSize(2);
+      display.print(temp, 1);
+      display.print(" C");
+      break;
+
+    case 1:
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Humidity");
+
+      display.setCursor(0, 35);
+      display.setTextSize(2);
+      display.print(hum, 0);
+      display.print(" %");
+      break;
+
+    case 2:
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Soil Moisture");
+
+      display.setCursor(0, 35);
+      display.setTextSize(2);
+      display.print(soil);
+      display.print(" %");
+      break;
+
+    case 3:
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Light Intensity");
+
+      display.setCursor(0, 35);
+      display.setTextSize(2);
+      display.print(lux, 0);
+      display.print(" lx");
+      break;
+
+    case 4:
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Air Quality");
+
+      display.setCursor(0, 35);
+      display.setTextSize(2);
+      display.print(air);
+      display.print(" %");
+      break;
+  }
+
+  display.display();
+}
+
+void cleanupHistory(String path) {
+
+  if (!Firebase.ready()) return;
+
+  FirebaseData fb;
+
+  if (Firebase.RTDB.getJSON(&fb, path)) {
+
+    FirebaseJson *json = fb.to<FirebaseJson*>();
+    size_t count = json->iteratorBegin();
+
+    if (count <= HISTORY_LIMIT) {
+      json->iteratorEnd();
+      return;
+    }
+
+    int toDelete = count - HISTORY_LIMIT;
+
+    Serial.print("Cleaning ");
+    Serial.print(path);
+    Serial.print(" removing: ");
+    Serial.println(toDelete);
+
+    String key, value;
+    int type;
+
+    for (size_t i = 0; i < count && toDelete > 0; i++) {
+
+      json->iteratorGet(i, type, key, value);
+
+      String deletePath = path + "/" + key;
+
+      Firebase.RTDB.deleteNode(&fb, deletePath);
+
+      toDelete--;
+    }
+
+    json->iteratorEnd();
+  }
+}
+
+/*telegram function*/
+void sendTelegramMessage(String message) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_BOT_TOKEN) + "/sendMessage";
+
+  String payload = "chat_id=" + String(TELEGRAM_CHAT_ID) + "&text=" + message;
+
+  https.begin(client, url);
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  int httpCode = https.POST(payload);
+
+  if (httpCode > 0) {
+    Serial.println("Telegram sent");
+  } else {
+    Serial.println("Telegram failed");
+  }
+
+  https.end();
+}
+
+void logAlert(String type, String message) {
+  if (!wifiOK || !Firebase.ready()) return;
+
+  FirebaseJson json;
+  json.set("type", type);
+  json.set("message", message);
+  json.set("time/.sv", "timestamp");
+
+  if (Firebase.RTDB.pushJSON(&fbdo, "/alertHistory", &json)) {
+    Serial.print("Alert logged: ");
+    Serial.println(type);
+  } else {
+    Serial.print("Alert log failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+/* ================= LOOP ================= */
+
+void loop() {
+
+  // -------- WIFI AUTO RECONNECT --------
+  if (millis() - lastWiFiCheck > 5000) {  // check every 5 sec
+    lastWiFiCheck = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+
+      Serial.println("Reconnecting WiFi...");
+
+      WiFi.begin();   // reconnect using saved credentials
+
+      unsigned long startAttempt = millis();
+
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000) {
+        delay(200);
+        Serial.print(".");
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi Reconnected!");
+        Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("\nReconnect failed");
+      }
+    }
+  }
+
+  wifiOK = (WiFi.status() == WL_CONNECTED);
+
+  if (!wifiOK) {
+    Serial.println("⚠ WiFi LOST → OFFLINE MODE");
+  }
+
+  static unsigned long pressStart = 0;
+
+  if (digitalRead(RESET_WIFI_PIN) == LOW) {
+
+    if (pressStart == 0) {
+      pressStart = millis();
+    }
+
+    if (millis() - pressStart > 5000) {   // 5 seconds hold
+      Serial.println("Long press detected → Reset WiFi");
+
+      WiFiManager wm;
+      wm.resetSettings();
+
+      delay(1000);
+      ESP.restart();
+    }
+
+  } else {
+    pressStart = 0;
+  }
+
+  /*display touch sensor*/
+  int currentTouchState = digitalRead(TOUCH_PIN);
+
+  if (currentTouchState == HIGH && lastTouchState == LOW) {
+    displayState = !displayState;
+
+    if (displayState) {
+      display.ssd1306_command(SSD1306_DISPLAYON);
+    } else {
+      display.ssd1306_command(SSD1306_DISPLAYOFF);
+    }
+
+    delay(300);
+  }
+
+  lastTouchState = currentTouchState;
+
+  static unsigned long lastSend = 0;
+
+  Serial.println("---- Loop Start ----");
+
+  /* ---------- SENSOR READ ---------- */
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+
+    Serial.println("DHT read failed!");
+    dhtOK = false;
+
+  }
+  else {
+
+    dhtOK = true;
+    lastSensorUpdate = millis();
+
+  }
+
+  int rawSoil = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    rawSoil += analogRead(SOIL_PIN);
+  }
+
+  rawSoil /= 10;
+
+  if (rawSoil <= 0 || rawSoil > 4095) {
+    soilOK = false;
+  }
+  else {
+    soilOK = true;
+  }
+
+  int soilMoisture = map(rawSoil, SOIL_DRY, SOIL_WET, 0, 100);
+  soilMoisture = constrain(soilMoisture, 0, 100);
+
+  int rssi = WiFi.RSSI();
+
+  Serial.print("Temp: ");
+  Serial.print(temperature);
+
+  Serial.print(" | Hum: ");
+  Serial.print(humidity);
+
+  Serial.print(" | Soil: ");
+  Serial.println(soilMoisture);
+
+  /*light sensor*/
+  float lux = lightMeter.readLightLevel();
+
+  if (lux < 0) {
+    lux = 0;
+  }
+
+  Serial.print("Light: ");
+  Serial.println(lux);
+
+  /*Gas sensor*/
+  int airRaw = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    airRaw += analogRead(MQ135_PIN);
+  }
+
+  airRaw /= 10;
+
+  int airQuality = map(airRaw, 400, 3000, 100, 0);
+  airQuality = constrain(airQuality, 0, 100);
+
+  Serial.print("Air Raw: ");
+  Serial.print(airRaw);
+
+  Serial.print(" | Air Quality: ");
+  Serial.println(airQuality);
+
+  // ---------- ALERT CONDITIONS ----------
+  bool highTempAlert = (!isnan(temperature) && temperature > tempOn);
+  bool lowSoilAlert  = (soilMoisture < soilOn);
+  bool badAirAlert   = (airQuality < airOn);
+  bool dhtFailAlert  = (!dhtOK);
+  bool soilFailAlert = (!soilOK);
+
+  /* ---------- SENSOR WATCHDOG ---------- */
+
+  if (millis() - lastSensorUpdate > sensorTimeout) {
+    Serial.println("Sensor watchdog timeout!");
+    dhtOK = false;
+  }
+
+  // ---------- ALERT HANDLING ----------
+  if (highTempAlert && !highTempSent) {
+    logAlert("HIGH_TEMP", "High temperature detected");
+    sendTelegramMessage("🚨 SmartAgri Alert\nHigh temperature detected");
+    highTempSent = true;
+  }
+  if (!highTempAlert && highTempSent) {
+    sendTelegramMessage("✅ SmartAgri Recovery\nTemperature back to normal");
+    highTempSent = false;
+  }
+
+  if (lowSoilAlert && !lowSoilSent) {
+    logAlert("LOW_SOIL", "Low soil moisture detected");
+    sendTelegramMessage("🚨 SmartAgri Alert\nLow soil moisture detected");
+    lowSoilSent = true;
+  }
+  if (!lowSoilAlert && lowSoilSent) {
+    sendTelegramMessage("✅ SmartAgri Recovery\nSoil moisture back to normal");
+    lowSoilSent = false;
+  }
+
+  if (badAirAlert && !badAirSent) {
+    logAlert("BAD_AIR", "Poor air quality detected");
+    sendTelegramMessage("🚨 SmartAgri Alert\nPoor air quality detected");
+    badAirSent = true;
+  }
+  if (!badAirAlert && badAirSent) {
+    sendTelegramMessage("✅ SmartAgri Recovery\nAir quality back to normal");
+    badAirSent = false;
+  }
+
+  if (dhtFailAlert && !dhtFailSent) {
+    logAlert("DHT_FAIL", "DHT sensor failure");
+    sendTelegramMessage("🚨 SmartAgri Alert\nDHT sensor failure");
+    dhtFailSent = true;
+  }
+  if (!dhtFailAlert && dhtFailSent) {
+    sendTelegramMessage("✅ SmartAgri Recovery\nDHT sensor working again");
+    dhtFailSent = false;
+  }
+
+  if (soilFailAlert && !soilFailSent) {
+    logAlert("SOIL_FAIL", "Soil sensor failure");
+    sendTelegramMessage("🚨 SmartAgri Alert\nSoil sensor failure");
+    soilFailSent = true;
+  }
+  if (!soilFailAlert && soilFailSent) {
+    sendTelegramMessage("✅ SmartAgri Recovery\nSoil sensor working again");
+    soilFailSent = false;
+  }
+
+  /* ---------- READ FIREBASE CONTROLS (JSON) ---------- */
+
+  if (Firebase.RTDB.getJSON(&fbdo, "/control")) {
+
+    FirebaseJson *json = fbdo.to<FirebaseJson*>();
+    FirebaseJsonData data;
+
+    if (json->get(data, "mode") && data.success) {
+      mode = data.stringValue;
+    }
+
+    if (json->get(data, "fanManual") && data.success) {
+      manualFanCommand = data.boolValue;
+    }
+
+    if (json->get(data, "tempOn") && data.success) {
+      float newVal = data.floatValue;
+
+      if (newVal != tempOn) {
+        tempOn = newVal;
+        prefs.putFloat("tempOn", tempOn);
+        Serial.println("Saved tempOn");
+      }
+    }
+
+    if (json->get(data, "tempOff") && data.success) {
+      float newVal = data.floatValue;
+
+      if (newVal != tempOff) {
+        tempOff = newVal;
+        prefs.putFloat("tempOff", tempOff);
+      }
+    }
+
+    if (json->get(data, "humOn") && data.success) {
+      float newVal = data.floatValue;
+
+      if (newVal != humOn) {
+        humOn = newVal;
+        prefs.putFloat("humOn", humOn);
+      }
+    }
+
+    if (json->get(data, "humOff") && data.success) {
+      float newVal = data.floatValue;
+
+      if (newVal != humOff) {
+        humOff = newVal;
+        prefs.putFloat("humOff", humOff);
+      }
+    }
+
+    if (json->get(data, "pumpMode") && data.success) {
+      pumpMode = data.stringValue;
+    }
+
+    if (json->get(data, "pumpManual") && data.success) {
+      pumpManualCommand = data.boolValue;
+    }
+
+    if (json->get(data, "soilOn") && data.success) {
+      int newVal = data.intValue;
+
+      if (newVal != soilOn) {
+        soilOn = newVal;
+        prefs.putInt("soilOn", soilOn);
+      }
+    }
+
+    if (json->get(data, "soilOff") && data.success) {
+      int newVal = data.intValue;
+
+      if (newVal != soilOff) {
+        soilOff = newVal;
+        prefs.putInt("soilOff", soilOff);
+      }
+    }
+  }
+
+  /* ---------- FAN CONTROL ---------- */
+
+  if (mode == "AUTO") {
+
+    // TURN ON
+    if (!fanState && (
+          temperature >= tempOn ||
+          humidity >= humOn ||
+          airQuality <= airOn
+        )) {
+
+      fanState = true;
+      Serial.println("Fan ON (AUTO - Temp/Hum/Air)");
+    }
+
+    // TURN OFF
+    if (fanState && (
+          temperature <= tempOff &&
+          humidity <= humOff &&
+          airQuality >= airOff
+        )) {
+
+      fanState = false;
+      Serial.println("Fan OFF (AUTO)");
+    }
+
+  }
+  else if (mode == "MANUAL") {
+
+    fanState = manualFanCommand;
+    Serial.println("Fan Manual Control");
+
+  }
+
+  digitalWrite(FAN_RELAY_PIN, fanState ? HIGH : LOW);
+
+  /* ---------- PUMP CONTROL ---------- */
+
+  if (pumpMode == "AUTO") {
+
+    if (!pumpState && soilMoisture <= soilOn) {
+      pumpState = true;
+      Serial.println("Pump ON (AUTO)");
+    }
+
+    if (pumpState && soilMoisture >= soilOff) {
+      pumpState = false;
+      Serial.println("Pump OFF (AUTO)");
+    }
+
+  }
+  else if (pumpMode == "MANUAL") {
+
+    pumpState = pumpManualCommand;
+    Serial.println("Pump Manual Control");
+
+  }
+
+  digitalWrite(PUMP_RELAY_PIN, pumpState ? HIGH : LOW);
+
+  if (millis() - lastSend > 3000) {
+    lastSend = millis();
+
+    if (wifiOK && Firebase.ready()) {
+
+      firebaseOK = true;
+
+      FirebaseJson sensorJson;
+
+      sensorJson.set("temperature", temperature);
+      sensorJson.set("humidity", humidity);
+      sensorJson.set("soil", soilMoisture);
+      sensorJson.set("light", lux);
+      sensorJson.set("air", airQuality);
+      sensorJson.set("fan", fanState);
+      sensorJson.set("pump", pumpState);
+
+      if (!Firebase.RTDB.updateNode(&fbdo, "/sensor", &sensorJson)) {
+        Serial.println("Sensor update failed");
+        Serial.println(fbdo.errorReason());
+      }
+
+      FirebaseJson statusJson;
+      statusJson.set("dht", dhtOK);
+      statusJson.set("soil", soilOK);
+
+      Firebase.RTDB.updateNode(&fbdo, "/sensorStatus", &statusJson);
+
+      FirebaseJson json;
+
+      json.set("wifiRSSI", rssi);
+      json.set("uptime", millis());
+      json.set("lastSeen/.sv", "timestamp");
+
+      Firebase.RTDB.updateNode(&fbdo, "/device", &json);
+
+    } else {
+
+      firebaseOK = false;
+      Serial.println("⚠ Offline → Skipping Firebase");
+    }
+  }
+
+  // ---------- HISTORY STORAGE ----------
+  if (wifiOK && Firebase.ready() && millis() - lastHistory > 300000) {
+    lastHistory = millis();
+
+    FirebaseJson hist;
+
+    /* Temperature */
+    hist.clear();
+    hist.set("value", temperature);
+    hist.set("time/.sv", "timestamp");
+    Firebase.RTDB.pushJSON(&fbdo, "/history/temperature", &hist);
+
+    /* Humidity */
+    hist.clear();
+    hist.set("value", humidity);
+    hist.set("time/.sv", "timestamp");
+    Firebase.RTDB.pushJSON(&fbdo, "/history/humidity", &hist);
+
+    /* Soil */
+    hist.clear();
+    hist.set("value", soilMoisture);
+    hist.set("time/.sv", "timestamp");
+    Firebase.RTDB.pushJSON(&fbdo, "/history/soil", &hist);
+
+    /* Light */
+    hist.clear();
+    hist.set("value", lux);
+    hist.set("time/.sv", "timestamp");
+    Firebase.RTDB.pushJSON(&fbdo, "/history/light", &hist);
+
+    /* Air */
+    hist.clear();
+    hist.set("value", airQuality);
+    hist.set("time/.sv", "timestamp");
+    Firebase.RTDB.pushJSON(&fbdo, "/history/air", &hist);
+  }
+
+  // OLED update only when display is ON
+  if (displayState) {
+    updateDisplay(temperature, humidity, soilMoisture, lux, airQuality);
+  }
+
+  Serial.print("Fan: ");
+  Serial.print(fanState);
+
+  Serial.print(" | Pump: ");
+  Serial.println(pumpState);
+
+  Serial.println("-------------------------");
+  Serial.println("cpu :");
+  Serial.println(getCpuFrequencyMhz());
+  delay(500);
+}
